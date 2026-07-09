@@ -239,6 +239,30 @@ def test_disasm_interior_address_preserves_cursor():
     assert result["asm"]["start_ea"] == hex(interior)
 
 
+@test()
+def test_disasm_linear_mode_from_interior_address():
+    """disasm(linear=True) returns sequential instructions from an interior function address."""
+    import idaapi
+    import idc
+
+    fn_addr = get_any_function()
+    if not fn_addr:
+        skip_test("binary has no functions")
+
+    func = idaapi.get_func(int(fn_addr, 16))
+    if not func:
+        skip_test("IDA could not resolve function object")
+
+    interior = idc.next_head(func.start_ea, func.end_ea)
+    if interior == idaapi.BADADDR or interior == func.start_ea:
+        skip_test("function has no interior instruction")
+
+    result = disasm(hex(interior), max_instructions=4, linear=True)
+    assert_ok(result, "asm")
+    assert result["asm"]["start_ea"] == hex(interior)
+    assert_non_empty(result["asm"]["lines"])
+
+
 @test(binary="crackme03.elf")
 def test_decompile_refs_include_check_pw():
     """decompile surfaces cot_obj refs, including the check_pw call target."""

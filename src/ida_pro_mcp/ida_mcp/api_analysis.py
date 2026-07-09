@@ -794,8 +794,12 @@ def disasm(
     include_total: Annotated[
         bool, "Compute total instruction count (default: false)"
     ] = False,
+    linear: Annotated[
+        bool,
+        "Disassemble linearly from the requested address and ignore current function bounds (default: false)",
+    ] = False,
 ) -> DisasmResult:
-    """Disassemble function with offset/max_instructions pagination and optional total count."""
+    """Disassemble code with offset/max_instructions pagination and optional linear mode."""
 
     # Enforce max limit
     if max_instructions <= 0 or max_instructions > 50000:
@@ -819,12 +823,12 @@ def disasm(
 
         segment_name = idaapi.get_segm_name(seg) if seg else "UNKNOWN"
 
-        if func:
-            # Function exists: disassemble function items starting from requested address
+        if func and not linear:
+            # Function exists: disassemble function items starting from requested address.
             func_name: str = ida_funcs.get_func_name(func.start_ea) or "<unnamed>"
             header_addr = start  # Use requested address, not function start
         else:
-            # No function: disassemble sequentially from start address
+            # No function, or caller explicitly requested linear traversal.
             func_name = "<no function>"
             header_addr = start
 
@@ -863,7 +867,7 @@ def disasm(
             seen += 1
             return include_total
 
-        if func:
+        if func and not linear:
             for ea in idautils.FuncItems(func.start_ea):
                 if ea == idaapi.BADADDR:
                     continue
