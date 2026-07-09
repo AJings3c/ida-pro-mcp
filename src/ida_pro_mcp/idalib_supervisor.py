@@ -310,7 +310,7 @@ class WorkerSession:
             "owned": self.owned,
             "adopted": True,
             "pid": self.pid,
-            "worker_pid": self.process.pid if self.process is not None else self.pid,
+            "worker_pid": self.pid if self.pid is not None else (self.process.pid if self.process is not None else None),
         }
 
     def is_alive(self) -> bool:
@@ -684,6 +684,31 @@ class IdalibSupervisor:
     def _session_is_reachable(self, session: WorkerSession) -> bool:
         return bool(self._probe_session_health(session)["reachable"])
 
+    def _discover_registered_worker_pid(self, host: str, port: int) -> int | None:
+        try:
+            instances = _discovery.discover_instances()
+        except Exception:
+            logger.debug("discover_instances failed while resolving worker pid", exc_info=True)
+            return None
+        for instance in instances:
+            if _discovered_instance_backend(instance) != "worker":
+                continue
+            if str(instance.get("host") or "127.0.0.1") != host:
+                continue
+            if int(instance.get("port") or 0) != port:
+                continue
+            pid = instance.get("pid")
+            return int(pid) if pid is not None else None
+        return None
+
+    def _worker_runtime_pid(self, worker: WorkerSession) -> int | None:
+        discovered = self._discover_registered_worker_pid(worker.host, worker.port)
+        if discovered is not None:
+            return discovered
+        if worker.process is not None:
+            return worker.process.pid
+        return worker.pid
+
     def _probe_session_health(self, session: WorkerSession) -> dict[str, Any]:
         process_alive = session.is_alive()
         result: dict[str, Any] = {
@@ -939,18 +964,26 @@ class IdalibSupervisor:
             raise self._augment_worker_error(worker, e) from e
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+        session_metadata = dict(worker_session.get("metadata") or {})
+        runtime_pid = self._worker_runtime_pid(worker)
+        if (
+            worker.process is not None
+            and runtime_pid is not None
+            and worker.process.pid != runtime_pid
+        ):
+            session_metadata.setdefault("launcher_pid", worker.process.pid)
         session = WorkerSession(
             session_id=session_id,
             input_path=str(worker_session.get("input_path") or resolved),
             filename=str(worker_session.get("filename") or Path(resolved).name),
             is_analyzing=bool(worker_session.get("is_analyzing", False)),
-            metadata=dict(worker_session.get("metadata") or {}),
+            metadata=session_metadata,
             host=worker.host,
             port=worker.port,
             process=worker.process,
             backend="worker",
             owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
+            pid=runtime_pid,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
         )
         with self._lock:
@@ -1030,18 +1063,30 @@ class IdalibSupervisor:
             raise self._augment_worker_error(worker, e) from e
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
+        replacement_metadata = {
+            **session.metadata,
+            **dict(worker_session.get("metadata") or {}),
+            "fallback_from_gui": True,
+        }
+        runtime_pid = self._worker_runtime_pid(worker)
+        if (
+            worker.process is not None
+            and runtime_pid is not None
+            and worker.process.pid != runtime_pid
+        ):
+            replacement_metadata.setdefault("launcher_pid", worker.process.pid)
         replacement = WorkerSession(
             session_id=session.session_id,
             input_path=str(worker_session.get("input_path") or resolved),
             filename=str(worker_session.get("filename") or Path(resolved).name),
             is_analyzing=bool(worker_session.get("is_analyzing", False)),
-            metadata={**session.metadata, **dict(worker_session.get("metadata") or {}), "fallback_from_gui": True},
+            metadata=replacement_metadata,
             host=worker.host,
             port=worker.port,
             process=worker.process,
             backend="worker",
             owned=True,
-            pid=worker.process.pid if worker.process is not None else None,
+            pid=runtime_pid,
             last_warmup=opened.get("warmup") if isinstance(opened, dict) else None,
         )
         with self._lock:

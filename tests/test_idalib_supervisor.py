@@ -596,6 +596,20 @@ def test_open_session_defaults_idle_ttl_sec_to_baseline(tmp_path):
     assert args["idle_ttl_sec"] == 600
 
 
+def test_open_session_prefers_discovered_worker_pid_for_owned_worker(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.bin"
+    sample.write_bytes(b"x")
+    sup = _FakeSupervisor()
+    monkeypatch.setattr(sup, "_discover_registered_worker_pid", lambda *_args, **_kwargs: 4321)
+
+    session = sup.open_session(str(sample), session_id="sample")
+
+    assert session.pid == 4321
+    assert session.metadata["launcher_pid"] == 12345
+    listed = sup.list_sessions()
+    assert listed[0]["worker_pid"] == 4321
+
+
 def test_open_session_skips_warmup_when_flags_disabled(tmp_path):
     sample = tmp_path / "sample.bin"
     sample.write_bytes(b"x")
