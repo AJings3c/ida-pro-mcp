@@ -499,6 +499,37 @@ def test_prefer_headless_adopts_only_registered_worker_backend(tmp_path):
         restore()
 
 
+def test_prefer_headless_adopts_registered_worker_instance(tmp_path, monkeypatch):
+    sample = tmp_path / "sample.bin"
+    idb = tmp_path / "sample.bin.i64"
+    sample.write_bytes(b"x")
+    idb.write_bytes(b"idb")
+    restore = _patch_discovery(
+        instances=[
+            {
+                "host": "127.0.0.1",
+                "port": 31337,
+                "pid": 4321,
+                "binary": "sample.bin",
+                "idb_path": str(idb),
+                "started_at": "now",
+                "backend": "worker",
+            }
+        ],
+        probe=True,
+    )
+    monkeypatch.setattr(supmod._discovery, "is_pid_alive", lambda pid: pid == 4321)
+    try:
+        sup = _FakeSupervisor()
+        session = sup.open_session(str(sample), session_id="sample", mode="prefer_headless")
+        assert session.backend == "worker"
+        assert session.owned is False
+        assert session.pid == 4321
+        assert not sup.opened, "existing persistent worker should be adopted, not reopened"
+    finally:
+        restore()
+
+
 def test_idb_list_omits_unadopted_when_already_adopted(tmp_path, monkeypatch):
     sample = tmp_path / "sample.bin"
     sample.write_bytes(b"x")
@@ -806,6 +837,38 @@ def test_probe_session_health_reports_rpc_ping_failure(monkeypatch):
     assert health["rpc_ping"] is False
     assert health["failed_probe"] == "rpc_ping"
     assert "rpc timeout" in health["error"]
+
+
+def test_probe_session_health_adopted_worker_uses_pid_and_rpc(monkeypatch):
+    sup = supmod.IdalibSupervisor(supmod.McpServer("test"))
+    worker = supmod.WorkerSession(
+        session_id="worker",
+        input_path="sample.bin",
+        filename="sample.bin",
+        host="127.0.0.1",
+        port=12345,
+        process=None,
+        owned=False,
+        pid=4321,
+    )
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(supmod._discovery, "is_pid_alive", lambda pid: pid == 4321)
+    monkeypatch.setattr(supmod.socket, "create_connection", lambda *_args, **_kwargs: _FakeSocket())
+    sup._worker_rpc = lambda *_args, **_kwargs: {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    health = sup._probe_session_health(worker)
+
+    assert health["process_alive"] is True
+    assert health["tcp_connect"] is True
+    assert health["rpc_ping"] is True
+    assert health["reachable"] is True
 
 
 def test_list_sessions_reports_is_active_from_health_probe(tmp_path):

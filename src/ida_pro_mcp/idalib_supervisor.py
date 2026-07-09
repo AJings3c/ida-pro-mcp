@@ -310,7 +310,7 @@ class WorkerSession:
             "owned": self.owned,
             "adopted": True,
             "pid": self.pid,
-            "worker_pid": self.process.pid if self.process is not None else None,
+            "worker_pid": self.process.pid if self.process is not None else self.pid,
         }
 
     def is_alive(self) -> bool:
@@ -319,7 +319,14 @@ class WorkerSession:
                 return bool(_discovery.probe_instance(self.host, self.port, timeout=0.5))
             except Exception:
                 return False
-        return self.process is not None and self.process.poll() is None
+        if self.process is not None:
+            return self.process.poll() is None
+        if self.pid is not None:
+            try:
+                return bool(_discovery.is_pid_alive(self.pid))
+            except Exception:
+                return False
+        return False
 
 
 class IdalibSupervisor:
