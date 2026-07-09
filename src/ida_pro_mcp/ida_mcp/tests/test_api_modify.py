@@ -429,6 +429,61 @@ def test_define_func_batch():
     assert_is_list(result, min_length=2)
 
 
+@test(binary="crackme03.elf")
+def test_define_func_inside_existing_function_reports_context():
+    """define_func on an inner instruction reports the containing function clearly."""
+    import idaapi
+    import idautils
+
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+
+    heads = list(idautils.FuncItems(func.start_ea))
+    if len(heads) < 2:
+        skip_test("frame_dummy is too small to probe an inner instruction")
+
+    inner_ea = heads[1]
+    result = define_func({"addr": hex(inner_ea)})[0]
+    assert_error(result, contains="inside existing function")
+    assert result.get("containing_function") == f"{hex(func.start_ea)}-{hex(func.end_ea)}"
+
+
+@test(binary="crackme03.elf")
+def test_define_func_misaligned_end_uses_actual_bounds():
+    """define_func tolerates a bad explicit end and reports the final IDA bounds."""
+    import idaapi
+
+    func = idaapi.get_func(int(CRACKME_FRAME_DUMMY, 16))
+    if not func:
+        skip_test("frame_dummy function not present")
+
+    start_ea = func.start_ea
+    original_end = func.end_ea
+    requested_end = start_ea + 1
+
+    try:
+        undef_result = undefine({"addr": hex(start_ea), "end": hex(original_end)})[0]
+        assert "error" not in undef_result
+        assert idaapi.get_func(start_ea) is None
+
+        define_result = define_func({"addr": hex(start_ea), "end": hex(requested_end)})[0]
+        assert "error" not in define_result
+        recreated = idaapi.get_func(start_ea)
+        assert recreated is not None
+        assert recreated.start_ea == start_ea
+        assert define_result.get("requested_end") == hex(requested_end)
+        assert define_result.get("end") == hex(recreated.end_ea)
+        assert define_result.get("warning")
+    finally:
+        current = idaapi.get_func(start_ea)
+        if current is not None:
+            undefine({"addr": hex(start_ea), "end": hex(current.end_ea)})
+        define_code({"addr": hex(start_ea)})
+        if idaapi.get_func(start_ea) is None:
+            define_func({"addr": hex(start_ea), "end": hex(original_end)})
+
+
 @test()
 def test_define_code_on_existing_code():
     """define_code on existing code returns a structured response instead of crashing."""

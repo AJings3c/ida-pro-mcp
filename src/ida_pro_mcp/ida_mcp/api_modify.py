@@ -91,6 +91,10 @@ class DefineResult(TypedDict, total=False):
     ea: str
     start: str
     end: str
+    requested_end: str
+    item_head: str
+    containing_function: str
+    warning: str
     size: int
     length: int
     error: str
@@ -917,37 +921,92 @@ def define_func(items: list[DefineOp] | DefineOp) -> list[DefineResult]:
         try:
             start_ea = parse_address(addr_str)
             end_ea = parse_address(end_str) if end_str else idaapi.BADADDR
+            item_head = ida_bytes.get_item_head(start_ea)
 
             # Check if already a function
             existing = idaapi.get_func(start_ea)
             if existing and existing.start_ea == start_ea:
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "start": hex(start_ea),
-                        "error": "Function already exists at this address",
-                    }
-                )
+                entry: DefineResult = {
+                    "addr": addr_str,
+                    "start": hex(start_ea),
+                    "end": hex(existing.end_ea),
+                    "error": "Function already exists at this address",
+                }
+                if end_str:
+                    entry["requested_end"] = hex(end_ea)
+                results.append(entry)
+                continue
+
+            if item_head != idaapi.BADADDR and item_head != start_ea:
+                entry = {
+                    "addr": addr_str,
+                    "start": hex(start_ea),
+                    "item_head": hex(item_head),
+                    "error": f"Address is not an item head (nearest head: {hex(item_head)})",
+                }
+                if existing:
+                    entry["containing_function"] = (
+                        f"{hex(existing.start_ea)}-{hex(existing.end_ea)}"
+                    )
+                if end_str:
+                    entry["requested_end"] = hex(end_ea)
+                results.append(entry)
+                continue
+
+            if existing:
+                entry = {
+                    "addr": addr_str,
+                    "start": hex(start_ea),
+                    "containing_function": (
+                        f"{hex(existing.start_ea)}-{hex(existing.end_ea)}"
+                    ),
+                    "error": (
+                        "Address lies inside existing function "
+                        f"{hex(existing.start_ea)}-{hex(existing.end_ea)}"
+                    ),
+                }
+                if end_str:
+                    entry["requested_end"] = hex(end_ea)
+                results.append(entry)
                 continue
 
             success = ida_funcs.add_func(start_ea, end_ea)
+            used_auto_end = False
+            if not success and end_str:
+                # Real-world RE often has approximate recovered bounds. If IDA
+                # rejects the explicit end, retry with auto-inferred bounds so
+                # the function is still created when the start address is valid.
+                success = ida_funcs.add_func(start_ea, idaapi.BADADDR)
+                used_auto_end = success
             if success:
                 func = idaapi.get_func(start_ea)
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "start": hex(func.start_ea),
-                        "end": hex(func.end_ea),
-                    }
-                )
+                entry = {
+                    "addr": addr_str,
+                    "start": hex(func.start_ea),
+                    "end": hex(func.end_ea),
+                }
+                if end_str:
+                    entry["requested_end"] = hex(end_ea)
+                    if used_auto_end:
+                        entry["warning"] = (
+                            f"IDA rejected requested end {hex(end_ea)}; "
+                            f"auto-inferred end {hex(func.end_ea)} instead"
+                        )
+                    elif func.end_ea != end_ea:
+                        entry["warning"] = (
+                            f"IDA adjusted requested end {hex(end_ea)} "
+                            f"to {hex(func.end_ea)}"
+                        )
+                results.append(entry)
             else:
-                results.append(
-                    {
-                        "addr": addr_str,
-                        "start": hex(start_ea),
-                        "error": "define_func failed",
-                    }
-                )
+                entry = {
+                    "addr": addr_str,
+                    "start": hex(start_ea),
+                    "error": "define_func failed",
+                }
+                if end_str:
+                    entry["requested_end"] = hex(end_ea)
+                results.append(entry)
         except Exception as e:
             results.append({"addr": addr_str, "error": str(e)})
 
