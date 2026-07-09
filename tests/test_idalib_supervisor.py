@@ -1,5 +1,6 @@
 """idalib supervisor tests that do not require IDA/idalib."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -126,6 +127,64 @@ def _patch_discovery(*, instances, probe):
 def test_supervisor_import_does_not_import_ida_modules():
     assert "idapro" not in sys.modules
     assert "idaapi" not in sys.modules
+
+
+def test_prepare_worker_launch_reads_ida_config_and_stages_hexlic(tmp_path, monkeypatch):
+    appdata = tmp_path / "AppData" / "Roaming"
+    config_dir = appdata / "Hex-Rays" / "IDA Pro"
+    config_dir.mkdir(parents=True)
+    install_dir = tmp_path / "IDA"
+    install_dir.mkdir()
+    (install_dir / "idapro.hexlic").write_text("license", encoding="utf-8")
+    (config_dir / "ida-config.json").write_text(
+        json.dumps({"Paths": {"ida-install-dir": str(install_dir)}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.delenv("IDAUSR", raising=False)
+    monkeypatch.delenv("IDADIR", raising=False)
+    monkeypatch.delenv("IDA_MCP_WORKER_CWD", raising=False)
+    monkeypatch.setenv("IDA_MCP_STAGE_INSTALL_LICENSE", "1")
+
+    env, cwd, details = supmod._prepare_worker_launch()
+
+    assert env["IDADIR"] == str(install_dir)
+    assert env["IDAUSR"] == str(config_dir)
+    assert cwd == str(install_dir)
+    assert details["idadir"] == str(install_dir)
+    assert details["idausr"] == str(config_dir)
+    assert details["staged_licenses"] == ["idapro.hexlic"]
+    assert (config_dir / "idapro.hexlic").read_text(encoding="utf-8") == "license"
+
+
+def test_augment_worker_error_includes_launch_context_and_log_tail(tmp_path):
+    log_path = tmp_path / "worker.log"
+    log_path.write_text("Cannot continue without a valid license -> OK\n", encoding="utf-8")
+    sup = supmod.IdalibSupervisor(supmod.McpServer("test"))
+    worker = supmod.WorkerSession(
+        session_id="worker",
+        input_path="",
+        filename="",
+        host="127.0.0.1",
+        port=12345,
+        process=_FakeProcess(),
+        metadata={
+            "idadir": r"E:\IDA",
+            "idausr": r"C:\Users\ki10Moc\AppData\Roaming\Hex-Rays\IDA Pro",
+            "cwd": r"E:\IDA",
+            "staged_licenses": ["idapro.hexlic"],
+        },
+        log_path=str(log_path),
+    )
+
+    error = sup._augment_worker_error(worker, RuntimeError("[WinError 10054] connection reset"))
+
+    text = str(error)
+    assert "WinError 10054" in text
+    assert "worker context" in text
+    assert "idapro.hexlic" in text
+    assert "valid license" in text
+    assert str(log_path) in text
 
 
 def test_worker_rpc_default_has_no_socket_timeout(monkeypatch):

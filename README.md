@@ -178,6 +178,28 @@ For stdio-based clients, use:
 uv run idalib-mcp --stdio
 ```
 
+On Windows, the supervisor now launches each headless worker with an explicit
+IDA runtime context:
+
+- it resolves `IDADIR` from the environment or the per-user `ida-config.json`
+- it pins `IDAUSR` to the effective user config directory
+- if the user directory has no `*.hexlic` file but the install directory does,
+  it stages the install license into the user directory by default
+
+This closes a common failure mode where `ida.exe`/`idat.exe` can open a
+database, but the headless `idalib` worker exits early with only a generic
+connection-reset error. Set `IDA_MCP_STAGE_INSTALL_LICENSE=0` to disable the
+automatic license staging behavior.
+
+Per-worker stdout/stderr is also written to log files under:
+
+```text
+%TEMP%\ida-pro-mcp
+```
+
+Override that location with `IDA_MCP_WORKER_LOG_DIR`. When a worker exits early,
+the supervisor now includes the tail of that log in the surfaced error message.
+
 Database workers are persistent: each one runs as a detached process that
 outlives the supervisor that spawned it. When a new supervisor (over stdio
 or HTTP) calls `idb_open` for a binary that is already open under a worker

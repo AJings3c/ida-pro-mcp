@@ -18,11 +18,13 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+import shutil
 from threading import RLock
 from typing import Annotated, Any, TypedDict
 
@@ -55,6 +57,7 @@ IDB_MANAGEMENT_TOOLS = {
 }
 WORKER_TCP_HEALTH_TIMEOUT_SEC = 0.5
 WORKER_RPC_HEALTH_TIMEOUT_SEC = 2.0
+WORKER_LOG_TAIL_LINES = int(os.environ.get("IDA_MCP_WORKER_LOG_TAIL_LINES", "80"))
 
 # Upper bound (seconds) on how long a worker may take to open and auto-analyze a
 # binary before it is reaped and an error is returned. A malformed or hostile
@@ -63,6 +66,139 @@ WORKER_RPC_HEALTH_TIMEOUT_SEC = 2.0
 # RPC waiting on it) forever, with no progress feedback and no recovery.
 # Set IDA_MCP_OPEN_TIMEOUT=0 to wait indefinitely (previous behavior).
 WORKER_OPEN_TIMEOUT_SEC = float(os.environ.get("IDA_MCP_OPEN_TIMEOUT", "1800"))
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _default_idausr_dir(env: dict[str, str]) -> Path | None:
+    explicit = env.get("IDAUSR")
+    if explicit:
+        return Path(explicit)
+    if os.name == "nt":
+        appdata = env.get("APPDATA")
+        if not appdata:
+            return None
+        return Path(appdata) / "Hex-Rays" / "IDA Pro"
+    home = env.get("HOME") or env.get("USERPROFILE")
+    if not home:
+        return None
+    return Path(home) / ".idapro"
+
+
+def _ida_config_path(env: dict[str, str]) -> Path | None:
+    user_dir = _default_idausr_dir(env)
+    if user_dir is None:
+        return None
+    return user_dir / "ida-config.json"
+
+
+def _load_idadir_from_env_or_config(env: dict[str, str]) -> str | None:
+    explicit = env.get("IDADIR")
+    if explicit:
+        return explicit
+    config_path = _ida_config_path(env)
+    if config_path is None or not config_path.exists():
+        return None
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        logger.debug("Failed to read IDA config at %s", config_path, exc_info=True)
+        return None
+    value = config.get("Paths", {}).get("ida-install-dir")
+    return str(value) if isinstance(value, str) and value else None
+
+
+def _write_ida_config(user_dir: Path, idadir: str) -> None:
+    config_path = user_dir / "ida-config.json"
+    config = {"Paths": {"ida-install-dir": idadir}}
+    if config_path.exists():
+        try:
+            current = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(current, dict):
+                config = current
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.debug("Ignoring unreadable IDA config at %s", config_path, exc_info=True)
+    config.setdefault("Paths", {})
+    if config["Paths"].get("ida-install-dir") == idadir:
+        return
+    config["Paths"]["ida-install-dir"] = idadir
+    user_dir.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=4), encoding="utf-8")
+
+
+def _stage_install_licenses(idadir: Path, user_dir: Path) -> list[str]:
+    if not _env_flag(
+        "IDA_MCP_STAGE_INSTALL_LICENSE",
+        default=(os.name == "nt"),
+    ):
+        return []
+    if not idadir.exists():
+        return []
+    staged: list[str] = []
+    for candidate in sorted(idadir.glob("*.hexlic")):
+        if not candidate.is_file():
+            continue
+        destination = user_dir / candidate.name
+        if destination.exists():
+            continue
+        user_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate, destination)
+        staged.append(candidate.name)
+    return staged
+
+
+def _prepare_worker_launch() -> tuple[dict[str, str], str | None, dict[str, Any]]:
+    env = os.environ.copy()
+    details: dict[str, Any] = {}
+    idadir = _load_idadir_from_env_or_config(env)
+    idausr = _default_idausr_dir(env)
+
+    if idausr is not None:
+        env.setdefault("IDAUSR", str(idausr))
+        details["idausr"] = str(idausr)
+
+    launch_cwd = env.get("IDA_MCP_WORKER_CWD")
+    if launch_cwd:
+        details["cwd"] = launch_cwd
+
+    if idadir:
+        env.setdefault("IDADIR", idadir)
+        details["idadir"] = idadir
+        launch_cwd = launch_cwd or idadir
+        if idausr is not None:
+            try:
+                _write_ida_config(idausr, idadir)
+                staged = _stage_install_licenses(Path(idadir), idausr)
+            except OSError:
+                logger.debug("Failed to prepare worker IDA user dir", exc_info=True)
+            else:
+                if staged:
+                    details["staged_licenses"] = staged
+    if launch_cwd:
+        details["cwd"] = launch_cwd
+    return env, launch_cwd, details
+
+
+def _worker_log_dir() -> Path:
+    configured = os.environ.get("IDA_MCP_WORKER_LOG_DIR")
+    if configured:
+        return Path(configured)
+    return Path(tempfile.gettempdir()) / "ida-pro-mcp"
+
+
+def _tail_lines(path: Path, limit: int = WORKER_LOG_TAIL_LINES) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    return "\n".join(lines[-limit:])
 
 
 def _import_zeromcp():
@@ -153,6 +289,7 @@ class WorkerSession:
     owned: bool = True
     pid: int | None = None
     last_warmup: dict[str, Any] | None = None
+    log_path: str | None = None
 
     def to_dict(self) -> IdalibSessionInfo:
         return {
@@ -214,6 +351,10 @@ class IdalibSupervisor:
 
     def _spawn_worker(self) -> WorkerSession:
         port = self._pick_port()
+        worker_env, worker_cwd, launch_details = _prepare_worker_launch()
+        log_dir = _worker_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"idalib-worker-{port}-{uuid.uuid4().hex[:8]}.log"
         cmd = [
             sys.executable,
             "-m",
@@ -233,14 +374,17 @@ class IdalibSupervisor:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             start_new_session = True
-        process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
-        )
+        with log_path.open("ab") as worker_log:
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=worker_log,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+                start_new_session=start_new_session,
+                env=worker_env,
+                cwd=worker_cwd,
+            )
         worker = WorkerSession(
             session_id=f"__worker_schema_{uuid.uuid4().hex[:8]}",
             input_path="",
@@ -251,6 +395,8 @@ class IdalibSupervisor:
             backend="worker",
             owned=True,
             pid=process.pid,
+            metadata=launch_details,
+            log_path=str(log_path),
         )
         try:
             self._wait_worker_ready(worker)
@@ -264,8 +410,11 @@ class IdalibSupervisor:
         last_error: Exception | None = None
         while time.monotonic() < deadline:
             if worker.process is not None and worker.process.poll() is not None:
-                raise RuntimeError(
-                    f"idalib worker exited early with code {worker.process.returncode}"
+                raise self._augment_worker_error(
+                    worker,
+                    RuntimeError(
+                        f"idalib worker exited early with code {worker.process.returncode}"
+                    ),
                 )
             try:
                 self._worker_rpc(worker, {"jsonrpc": "2.0", "id": 1, "method": "ping"}, timeout=2.0)
@@ -273,7 +422,36 @@ class IdalibSupervisor:
             except Exception as e:
                 last_error = e
                 time.sleep(0.2)
-        raise TimeoutError(f"idalib worker did not become ready: {last_error}")
+        raise self._augment_worker_error(
+            worker,
+            TimeoutError(f"idalib worker did not become ready: {last_error}"),
+        )
+
+    def _augment_worker_error(self, worker: WorkerSession, error: Exception) -> RuntimeError:
+        message = str(error)
+        details: list[str] = [message]
+        idadir = worker.metadata.get("idadir")
+        idausr = worker.metadata.get("idausr")
+        cwd = worker.metadata.get("cwd")
+        if idadir or idausr or cwd:
+            context_bits = []
+            if idadir:
+                context_bits.append(f"IDADIR={idadir}")
+            if idausr:
+                context_bits.append(f"IDAUSR={idausr}")
+            if cwd:
+                context_bits.append(f"cwd={cwd}")
+            details.append("worker context: " + ", ".join(context_bits))
+        staged = worker.metadata.get("staged_licenses")
+        if staged:
+            details.append("staged install licenses: " + ", ".join(map(str, staged)))
+        if worker.log_path:
+            tail = _tail_lines(Path(worker.log_path))
+            if tail:
+                details.append(f"worker log tail ({worker.log_path}):\n{tail}")
+            else:
+                details.append(f"worker log path: {worker.log_path}")
+        return RuntimeError("\n".join(details))
 
     def _terminate_worker(self, worker: WorkerSession) -> None:
         if worker.backend != "worker" or not worker.owned:
@@ -749,9 +927,9 @@ class IdalibSupervisor:
                 f"unbounded loop. Retry with run_auto_analysis=false (open without "
                 f"analysis and decompile on demand), or raise IDA_MCP_OPEN_TIMEOUT."
             ) from None
-        except Exception:
+        except Exception as e:
             self._terminate_worker(worker)
-            raise
+            raise self._augment_worker_error(worker, e) from e
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
         session = WorkerSession(
@@ -840,9 +1018,9 @@ class IdalibSupervisor:
             )
             if isinstance(opened, dict) and opened.get("error"):
                 raise RuntimeError(str(opened["error"]))
-        except Exception:
+        except Exception as e:
             self._terminate_worker(worker)
-            raise
+            raise self._augment_worker_error(worker, e) from e
 
         worker_session = opened.get("session", {}) if isinstance(opened, dict) else {}
         replacement = WorkerSession(

@@ -64,6 +64,41 @@ _BOUND_HOST: str = ""
 _BOUND_PORT: int = 0
 
 
+def _default_idausr_dir() -> Path | None:
+    explicit = os.environ.get("IDAUSR")
+    if explicit:
+        return Path(explicit)
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return None
+        return Path(appdata) / "Hex-Rays" / "IDA Pro"
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
+    if not home:
+        return None
+    return Path(home) / ".idapro"
+
+
+def _log_environment_diagnostics() -> None:
+    idadir = os.environ.get("IDADIR")
+    idausr = _default_idausr_dir()
+    user_hexlics: list[str] = []
+    install_hexlics: list[str] = []
+    if idausr is not None and idausr.exists():
+        user_hexlics = sorted(path.name for path in idausr.glob("*.hexlic") if path.is_file())
+    if idadir:
+        install_dir = Path(idadir)
+        if install_dir.exists():
+            install_hexlics = sorted(path.name for path in install_dir.glob("*.hexlic") if path.is_file())
+    logger.info(
+        "IDALib environment: IDADIR=%s IDAUSR=%s user_hexlics=%s install_hexlics=%s",
+        idadir or "<unset>",
+        str(idausr) if idausr is not None else "<unset>",
+        user_hexlics or ["<none>"],
+        install_hexlics or ["<none>"],
+    )
+
+
 def _register_in_discovery(host: str, port: int, input_path: Path) -> None:
     global _REGISTERED_PORT
     try:
@@ -138,8 +173,10 @@ def idb_open(
             ),
         }
     except (FileNotFoundError, RuntimeError, ValueError) as e:
+        logger.exception("idb_open failed for %s", input_path)
         return {"error": str(e)}
     except Exception as e:
+        logger.exception("Unexpected idb_open failure for %s", input_path)
         return {"error": f"Unexpected error: {e}"}
 
 
@@ -213,6 +250,7 @@ def main():
 
     logging.basicConfig(level=log_level)
     logging.getLogger().setLevel(log_level)
+    _log_environment_diagnostics()
 
     global _BOUND_HOST, _BOUND_PORT
     _BOUND_HOST = args.host
@@ -226,7 +264,11 @@ def main():
 
         logger.info("opening initial database: %s", args.input_path)
         resolved = args.input_path.resolve()
-        session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
+        try:
+            session_id = session_manager.open_binary(resolved, run_auto_analysis=True)
+        except Exception:
+            logger.exception("Initial database open failed for %s", resolved)
+            raise
         logger.info("Initial session created: %s", session_id)
         _register_in_discovery(args.host, args.port, resolved)
     else:
